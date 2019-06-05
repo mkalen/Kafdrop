@@ -18,9 +18,11 @@
 
 package com.homeadvisor.kafdrop.model;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
-
 import java.util.Date;
+import java.util.List;
+import java.util.Map;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
 
 public class BrokerVO
 {
@@ -30,6 +32,8 @@ public class BrokerVO
    private int jmxPort;
    private int version;
    private boolean controller;
+   private Map<String,String> listenerSecurityProtocolMap;
+   private List<String> endpoints;
    private Date timestamp;
 
    public int getId()
@@ -101,5 +105,25 @@ public class BrokerVO
    public void setController(boolean controller)
    {
       this.controller = controller;
+   }
+
+   public Map<String,String> getListenerSecurityProtocolMap()
+   {
+       return this.listenerSecurityProtocolMap;
+   }
+
+   public void setListenerSecurityProtocolMap(Map<String,String> listenerSecurityProtocolMap)
+   {
+       this.listenerSecurityProtocolMap = listenerSecurityProtocolMap;
+   }
+
+   public List<String> getEndpoints()
+   {
+       return this.endpoints;
+   }
+
+   public void setEndpoints(List<String> endpoints)
+   {
+       this.endpoints = endpoints;
    }
 }

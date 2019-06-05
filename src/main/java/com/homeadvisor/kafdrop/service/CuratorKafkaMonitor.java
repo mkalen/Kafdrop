@@ -18,26 +18,37 @@
 
 package com.homeadvisor.kafdrop.service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.base.Throwables;
-import com.google.common.collect.ImmutableMap;
-import com.homeadvisor.kafdrop.model.*;
-import com.homeadvisor.kafdrop.util.BrokerChannel;
-import com.homeadvisor.kafdrop.util.Version;
-import kafka.api.ConsumerMetadataRequest;
-import kafka.api.PartitionOffsetRequestInfo;
-import kafka.cluster.Broker;
-import kafka.common.ErrorMapping;
-import kafka.common.TopicAndPartition;
-import kafka.javaapi.*;
-import kafka.network.BlockingChannel;
-import kafka.utils.ZKGroupDirs;
-import kafka.utils.ZKGroupTopicDirs;
-import kafka.utils.ZkUtils;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.LongStream;
+import java.util.stream.Stream;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+
 import org.apache.commons.lang.StringUtils;
 import org.apache.curator.framework.CuratorFramework;
-import org.apache.curator.framework.recipes.cache.*;
+import org.apache.curator.framework.recipes.cache.ChildData;
+import org.apache.curator.framework.recipes.cache.NodeCache;
+import org.apache.curator.framework.recipes.cache.PathChildrenCache;
 import org.apache.curator.framework.recipes.cache.PathChildrenCache.StartMode;
+import org.apache.curator.framework.recipes.cache.PathChildrenCacheEvent;
+import org.apache.curator.framework.recipes.cache.PathChildrenCacheListener;
+import org.apache.curator.framework.recipes.cache.TreeCache;
+import org.apache.curator.framework.recipes.cache.TreeCacheEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -46,17 +57,42 @@ import org.springframework.retry.policy.SimpleRetryPolicy;
 import org.springframework.retry.support.RetryTemplate;
 import org.springframework.stereotype.Service;
 
-import javax.annotation.PostConstruct;
-import javax.annotation.PreDestroy;
-import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.ForkJoinTask;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
-import java.util.stream.LongStream;
-import java.util.stream.Stream;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategy;
+import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableMap;
+import com.homeadvisor.kafdrop.model.BrokerVO;
+import com.homeadvisor.kafdrop.model.ClusterSummaryVO;
+import com.homeadvisor.kafdrop.model.ConsumerPartitionVO;
+import com.homeadvisor.kafdrop.model.ConsumerRegistrationVO;
+import com.homeadvisor.kafdrop.model.ConsumerTopicVO;
+import com.homeadvisor.kafdrop.model.ConsumerVO;
+import com.homeadvisor.kafdrop.model.TopicPartitionStateVO;
+import com.homeadvisor.kafdrop.model.TopicPartitionVO;
+import com.homeadvisor.kafdrop.model.TopicRegistrationVO;
+import com.homeadvisor.kafdrop.model.TopicVO;
+import com.homeadvisor.kafdrop.util.BrokerChannel;
+import com.homeadvisor.kafdrop.util.Version;
+
+import kafka.api.GroupCoordinatorRequest;
+import kafka.api.PartitionOffsetRequestInfo;
+import kafka.cluster.BrokerEndPoint;
+import kafka.common.ErrorMapping;
+import kafka.common.TopicAndPartition;
+import kafka.javaapi.GroupCoordinatorResponse;
+import kafka.javaapi.OffsetFetchRequest;
+import kafka.javaapi.OffsetFetchResponse;
+import kafka.javaapi.OffsetRequest;
+import kafka.javaapi.OffsetResponse;
+import kafka.javaapi.PartitionMetadata;
+import kafka.javaapi.TopicMetadata;
+import kafka.javaapi.TopicMetadataRequest;
+import kafka.javaapi.TopicMetadataResponse;
+import kafka.network.BlockingChannel;
+import kafka.server.ConfigType;
+import kafka.utils.ZKGroupDirs;
+import kafka.utils.ZKGroupTopicDirs;
+import kafka.utils.ZkUtils;
 
 @Service
 public class CuratorKafkaMonitor implements KafkaMonitor
@@ -103,6 +139,9 @@ public class CuratorKafkaMonitor implements KafkaMonitor
 
       threadPool = new ForkJoinPool(properties.getThreadPoolSize());
 
+      objectMapper.setPropertyNamingStrategy(
+              PropertyNamingStrategy.CAMEL_CASE_TO_LOWER_CASE_WITH_UNDERSCORES);
+      
       FixedBackOffPolicy backOffPolicy = new FixedBackOffPolicy();
       backOffPolicy.setBackOffPeriod(properties.getRetry().getBackoffMillis());
 
@@ -117,7 +156,8 @@ public class CuratorKafkaMonitor implements KafkaMonitor
 
       cacheInitCounter.set(4);
 
-      brokerPathCache = new PathChildrenCache(curatorFramework, ZkUtils.BrokerIdsPath(), true);
+      // TODO: re-factor to org.apache.kafka.clients.admin.AdminClient;
+      brokerPathCache = new PathChildrenCache(curatorFramework, "/brokers/ids", true);
       brokerPathCache.getListenable().addListener(new BrokerListener());
       brokerPathCache.getListenable().addListener((f, e) -> {
          if (e.getType() == PathChildrenCacheEvent.Type.INITIALIZED)
@@ -128,7 +168,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
       });
       brokerPathCache.start(StartMode.POST_INITIALIZED_EVENT);
 
-      topicConfigPathCache = new PathChildrenCache(curatorFramework, ZkUtils.TopicConfigPath(), true);
+      topicConfigPathCache = new PathChildrenCache(curatorFramework, "/config/topics", true);
       topicConfigPathCache.getListenable().addListener((f, e) -> {
          if (e.getType() == PathChildrenCacheEvent.Type.INITIALIZED)
          {
@@ -138,7 +178,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
       });
       topicConfigPathCache.start(StartMode.POST_INITIALIZED_EVENT);
 
-      topicTreeCache = new TreeCache(curatorFramework, ZkUtils.BrokerTopicsPath());
+      topicTreeCache = new TreeCache(curatorFramework, "/brokers/topics");
       topicTreeCache.getListenable().addListener((client, event) -> {
          if (event.getType() == TreeCacheEvent.Type.INITIALIZED)
          {
@@ -148,7 +188,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
       });
       topicTreeCache.start();
 
-      consumerTreeCache = new TreeCache(curatorFramework, ZkUtils.ConsumersPath());
+      consumerTreeCache = new TreeCache(curatorFramework, "/consumers");
       consumerTreeCache.getListenable().addListener((client, event) -> {
          if (event.getType() == TreeCacheEvent.Type.INITIALIZED)
          {
@@ -158,7 +198,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
       });
       consumerTreeCache.start();
 
-      controllerNodeCache = new NodeCache(curatorFramework, ZkUtils.ControllerPath());
+      controllerNodeCache = new NodeCache(curatorFramework, "/controller");
       controllerNodeCache.getListenable().addListener(this::updateController);
       controllerNodeCache.start(true);
       updateController();
@@ -213,7 +253,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
 
    private int brokerId(ChildData input)
    {
-      return Integer.parseInt(StringUtils.substringAfter(input.getPath(), ZkUtils.BrokerIdsPath() + "/"));
+      return Integer.parseInt(StringUtils.substringAfter(input.getPath(), "/brokers/ids/"));
    }
 
    private BrokerVO addBroker(BrokerVO broker)
@@ -392,7 +432,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
             objectMapper.reader(TopicRegistrationVO.class).readValue(input.getData());
 
          topic.setConfig(
-            Optional.ofNullable(topicConfigPathCache.getCurrentData(ZkUtils.TopicConfigPath() + "/" + topic.getName()))
+            Optional.ofNullable(topicConfigPathCache.getCurrentData(ZkUtils.getEntityConfigPath(ConfigType.Topic()) + "/" + topic.getName()))
                .map(this::readTopicConfig)
                .orElse(Collections.emptyMap()));
 
@@ -437,7 +477,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
 
       channel.send(request);
       final kafka.api.TopicMetadataResponse underlyingResponse =
-         kafka.api.TopicMetadataResponse.readFrom(channel.receive().buffer());
+         kafka.api.TopicMetadataResponse.readFrom(channel.receive().payload());
 
       LOG.debug("Received topic metadata response: {}", underlyingResponse);
 
@@ -453,7 +493,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
       TopicVO topic = new TopicVO(tmd.topic());
 
       topic.setConfig(
-         Optional.ofNullable(topicConfigPathCache.getCurrentData(ZkUtils.TopicConfigPath() + "/" + topic.getName()))
+         Optional.ofNullable(topicConfigPathCache.getCurrentData(ZkUtils.getEntityConfigPath(ConfigType.Topic()) + "/" + topic.getName()))
             .map(this::readTopicConfig)
             .orElse(Collections.emptyMap()));
 
@@ -482,7 +522,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
 
    private List<Integer> getIsr(String topic, PartitionMetadata pmd)
    {
-      return pmd.isr().stream().map(Broker::id).collect(Collectors.toList());
+      return pmd.isr().stream().map(BrokerEndPoint::id).collect(Collectors.toList());
    }
 
    private Map<String, Object> readTopicConfig(ChildData d)
@@ -741,7 +781,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
       channel.send(request.underlying());
 
       final kafka.api.OffsetFetchResponse underlyingResponse =
-         kafka.api.OffsetFetchResponse.readFrom(channel.receive().buffer());
+         kafka.api.OffsetFetchResponse.readFrom(channel.receive().payload());
 
       LOG.debug("Received consumer offset response: {}", underlyingResponse);
 
@@ -766,14 +806,14 @@ public class CuratorKafkaMonitor implements KafkaMonitor
 
    private Integer offsetManagerBroker(BlockingChannel channel, String groupId)
    {
-      final ConsumerMetadataRequest request =
-         new ConsumerMetadataRequest(groupId, (short) 0, 0, clientId());
+      final GroupCoordinatorRequest request =
+         new GroupCoordinatorRequest(groupId, (short) 0, 0, clientId());
 
       LOG.debug("Sending consumer metadata request: {}", request);
 
       channel.send(request);
-      ConsumerMetadataResponse response =
-         ConsumerMetadataResponse.readFrom(channel.receive().buffer());
+      GroupCoordinatorResponse response =
+              GroupCoordinatorResponse.readFrom(channel.receive().payload());
 
       LOG.debug("Received consumer metadata response: {}", response);
 
@@ -866,7 +906,7 @@ public class CuratorKafkaMonitor implements KafkaMonitor
                         {
                            channel.send(offsetRequest.underlying());
                            final kafka.api.OffsetResponse underlyingResponse =
-                              kafka.api.OffsetResponse.readFrom(channel.receive().buffer());
+                              kafka.api.OffsetResponse.readFrom(channel.receive().payload());
 
                            LOG.debug("Received offset response: {}", underlyingResponse);
 
